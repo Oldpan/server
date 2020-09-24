@@ -42,7 +42,6 @@ from distutils.dir_util import copy_tree
 #
 EXAMPLE_BACKENDS = ['identity', 'square', 'repeat']
 FLAGS = None
-LOG_FILE = None
 
 # Map from container version to corresponding component versions
 # container-version -> (ort version, ort openvino version)
@@ -58,11 +57,6 @@ def log(msg, force=False):
             print(msg)
         except Exception:
             print('<failed to log>')
-    if LOG_FILE is not None:
-        try:
-            LOG_FILE.write(msg + '\n')
-        except Exception:
-            LOG_FILE.write('<failed to log>\n')
 
 
 def log_verbose(msg):
@@ -76,8 +70,6 @@ def fail(msg):
 
 def fail_if(p, msg):
     if p:
-        if LOG_FILE is not None:
-            LOG_FILE.write('error: {}\n'.format(msg))
         print('error: {}'.format(msg))
         sys.exit(1)
 
@@ -200,9 +192,11 @@ def container_build(container_version):
     else:
         fail('unsupported container version {}'.format(container_version))
 
-    client = docker.from_env()
-
-    buildargs = {
+    # We can't use docker module for building container because it
+    # doesn't stream output and it also seems to handle cache-from
+    # incorrectly which leads to excessive rebuilds in the multistage
+    # build.
+    buildargmap = {
         'TRITON_VERSION':
             FLAGS.version,
         'TRITON_CONTAINER_VERSION':
@@ -217,7 +211,22 @@ def container_build(container_version):
             onnx_runtime_openvino_version
     }
 
-    log_verbose('buildbase container {}'.format(buildargs))
+    cachefrommap = [
+        'tritonserver_pytorch', 'tritonserver_pytorch_cache0',
+        'tritonserver_pytorch_cache1', 'tritonserver_onnx',
+        'tritonserver_onnx_cache0', 'tritonserver_onnx_cache1',
+        'tritonserver_buildbase', 'tritonserver_buildbase_cache0',
+        'tritonserver_buildbase_cache1'
+    ]
+
+    buildargs = [
+        '--build-arg="{}={}"'.format(k, buildargmap[k]) for k in buildargmap
+    ]
+    cachefromargs = ['--cache-from={}'.format(k) for k in cachefrommap]
+    commonargs = ['docker', 'build', '--pull', '-f', 'Dockerfile.buildbase']
+
+    log_verbose('buildbase container {}'.format(commonargs + cachefromargs +
+                                                buildargs))
     try:
         # First build Dockerfile.buildbase. Because of the way Docker
         # does caching with multi-stage images, we must build each
@@ -226,66 +235,35 @@ def container_build(container_version):
         # clean docker cache each time).
 
         # PyTorch
-        image, output = client.images.build(path='.',
-                                            rm=True,
-                                            quiet=False,
-                                            pull=True,
-                                            tag='tritonserver_pytorch',
-                                            dockerfile='Dockerfile.buildbase',
-                                            target='tritonserver_pytorch',
-                                            cache_from=[
-                                                'tritonserver_pytorch',
-                                                'tritonserver_pytorch_cache0',
-                                                'tritonserver_pytorch_cache1'
-                                            ],
-                                            buildargs=buildargs)
-        if FLAGS.verbose:
-            for ln in output:
-                log_verbose(ln)
+        p = subprocess.Popen(commonargs + cachefromargs + buildargs + [
+            '-t', 'tritonserver_pytorch', '--target', 'tritonserver_pytorch',
+            '.'
+        ])
+        p.wait()
+        fail_if(p.returncode != 0, 'docker build tritonserver_pytorch failed')
 
         # ONNX Runtime
-        image, output = client.images.build(path='.',
-                                            rm=True,
-                                            quiet=False,
-                                            pull=True,
-                                            tag='tritonserver_onnx',
-                                            dockerfile='Dockerfile.buildbase',
-                                            target='tritonserver_onnx',
-                                            cache_from=[
-                                                'tritonserver_pytorch',
-                                                'tritonserver_pytorch_cache0',
-                                                'tritonserver_pytorch_cache1'
-                                                'tritonserver_onnx',
-                                                'tritonserver_onnx_cache0',
-                                                'tritonserver_onnx_cache1'
-                                            ],
-                                            buildargs=buildargs)
-        if FLAGS.verbose:
-            for ln in output:
-                log_verbose(ln)
+        p = subprocess.Popen(
+            commonargs + cachefromargs + buildargs +
+            ['-t', 'tritonserver_onnx', '--target', 'tritonserver_onnx', '.'])
+        p.wait()
+        fail_if(p.returncode != 0, 'docker build tritonserver_onnx failed')
 
         # Final buildbase image
-        image, output = client.images.build(path='.',
-                                            rm=True,
-                                            quiet=False,
-                                            pull=True,
-                                            tag='tritonserver_buildbase',
-                                            dockerfile='Dockerfile.buildbase',
-                                            cache_from=[
-                                                'tritonserver_pytorch',
-                                                'tritonserver_pytorch_cache0',
-                                                'tritonserver_pytorch_cache1'
-                                                'tritonserver_onnx',
-                                                'tritonserver_onnx_cache0',
-                                                'tritonserver_onnx_cache1'
-                                                'tritonserver_buildbase',
-                                                'tritonserver_buildbase_cache0',
-                                                'tritonserver_buildbase_cache1'
-                                            ],
-                                            buildargs=buildargs)
-        if FLAGS.verbose:
-            for ln in output:
-                log_verbose(ln)
+        p = subprocess.Popen(commonargs + cachefromargs + buildargs +
+                             ['-t', 'tritonserver_buildbase', '.'])
+        p.wait()
+        fail_if(p.returncode != 0, 'docker build tritonserver_buildbase failed')
+
+        # Before attempting to run the new image, make sure any
+        # previous 'tritonserver_build' container is removed.
+        client = docker.from_env()
+
+        try:
+            existing = client.containers.get('tritonserver_build')
+            existing.remove()
+        except docker.errors.NotFound:
+            pass  # ignore
 
         # Next run build.py inside the container with the same flags
         # as was used to run this instance, except with
@@ -295,8 +273,8 @@ def container_build(container_version):
             for a in sys.argv
         ]
         container = client.containers.run(
-            image,
-            'build.py {}'.format(runargs.join(' ')),
+            'tritonserver_buildbase',
+            'build.py {}'.format(' '.join(runargs)),
             detach=True,
             name='tritonserver_build',
             volumes={
@@ -304,10 +282,19 @@ def container_build(container_version):
                     'bind': '/var/run/docker.sock',
                     'mode': 'rw'
                 }
-            })
+            },
+            working_dir='/workspace')
         if FLAGS.verbose:
             for ln in container.logs(stream=True):
                 log_verbose(ln)
+
+        # Build is complete, save the container as the tritonserver_build image.
+        try:
+            client.images.remove('tritonserver_build')
+        except docker.errors.ImageNotFound:
+            pass  # ignore
+
+        container.commit('tritonserver_build', 'latest')
 
     except Exception as e:
         logging.error(traceback.format_exc())
@@ -334,13 +321,6 @@ if __name__ == '__main__':
                           action="store_true",
                           required=False,
                           help='Enable verbose output.')
-    parser.add_argument(
-        '--log-file',
-        type=str,
-        required=False,
-        help=
-        'File where verbose output should be recorded, even if --quiet flag is specified.'
-    )
 
     parser.add_argument(
         '--build-dir',
@@ -405,9 +385,6 @@ if __name__ == '__main__':
     )
 
     FLAGS = parser.parse_args()
-
-    if FLAGS.log_file is not None:
-        LOG_FILE = open(FLAGS.log_file, "w")
 
     # If --container-version is specified then we use
     # Dockerfile.buildbase to create the appropriate base build

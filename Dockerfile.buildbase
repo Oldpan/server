@@ -163,14 +163,15 @@ RUN apt-get update && \
             libssl-dev \
             libtool \
             libboost-dev \
-            rapidjson-dev \
+            libcurl4-openssl-dev \
             libb64-dev \
             patchelf \
             python3-dev \
             python3-pip \
             python3-setuptools \
+            rapidjson-dev \
             software-properties-common \
-            libcurl4-openssl-dev \
+            wget \
             zlib1g-dev && \
     rm -rf /var/lib/apt/lists/*
 
@@ -271,8 +272,9 @@ RUN cd /opt/tritonserver/backends/onnxruntime && \
     done
 
 WORKDIR /workspace
-RUN rm -fr *
+RUN rm -fr /opt/* && rm -fr *
 COPY build.py build.py
+ENTRYPOINT []
 
 ENV TRITON_SERVER_VERSION ${TRITON_VERSION}
 ENV NVIDIA_TRITON_SERVER_VERSION ${TRITON_CONTAINER_VERSION}
