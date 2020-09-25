@@ -270,11 +270,12 @@ def container_build(container_version):
         # --container-version changes to --upstream-container-version.
         runargs = [
             a.replace('--container-version', '--upstream-container-version')
-            for a in sys.argv
+            for a in sys.argv[1:]
         ]
+        log_verbose('run {}'.format(runargs))
         container = client.containers.run(
             'tritonserver_buildbase',
-            'build.py {}'.format(' '.join(runargs)),
+            './build.py {}'.format(' '.join(runargs)),
             detach=True,
             name='tritonserver_build',
             volumes={
@@ -290,11 +291,12 @@ def container_build(container_version):
 
         # Build is complete, save the container as the tritonserver_build image.
         try:
-            client.images.remove('tritonserver_build')
+            client.images.remove('tritonserver_build', force=True)
         except docker.errors.ImageNotFound:
             pass  # ignore
 
         container.commit('tritonserver_build', 'latest')
+        container.remove(force=True)
 
     except Exception as e:
         logging.error(traceback.format_exc())
